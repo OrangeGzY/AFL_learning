@@ -1,4 +1,6 @@
-# AFL源码阅读笔记
+# AFL源码阅读笔记(1)
+**本部分主要是对于整个项目的执行流程进行大体的阅读，目标在于掌握大致的流程与功能，但此部分笔记仍留有一些细节问题，会在后面的笔记/随着本人理解的加深进行补充解释**
+
 *Writen by: ScUpax0s/初号机*
 
 特别感谢Sakura师傅和花花姐姐～
@@ -166,8 +168,657 @@ alf-fuzz.c一共四舍五入8000行～
 - 如果是tty启动（终端），那么先sleep 4 秒，start_time += 4000。
   - 再检测如果设置了stop_soon，跳转到stop_fuzzing
 
-**至此，整个启动前的初始化完成，准备进入fuzz大循环**
+**至此，整个启动前的初始化完成，准备进入fuzz主循环**
 ***
+- 进入循环一开始，首先再次简化队列。
+  ```cull_queue()```
+- ```queue_cur```指向当前队列中的元素。（entry）
+- 如果```queue_cur```说明此时整个队列已经扫描了一遍了。
+  - ```queue_cycle```计数加一，说明走了一个循环了。
+  - ```current_entry```归零。
+  - ```cur_skipped_paths```归零。
+  - ```queue_cur```重新指向队头。
+  - 如果```seek_to```不为零。
+    - ```queue_cur```顺着队列持续后移。
+    - 同时```seek_to--```；```current_entry++```
+    - 直到```seek_to==0```
+    个人感觉就是把```queue_cur```置位到```seek_to```的位置。
+  - ```show_stats()```展示状态
+  - 如果不是终端模式即：```not_on_tty==1```
+    - 输出当前是第几个循环
+    ```ACTF("Entering queue cycle %llu.", queue_cycle);```
+  - 如果我们经历了一个完整的扫描周期后都没有新的路径发现，那么尝试调整策略。
+  - 如果：```queued_paths == prev_queued```相等。
+    - 当设置了```use_splicing```
+      - ```cycles_wo_finds```计数加一。
+    - 否则设置```use_splicing```为1。（代表我们要通过splicing进行队列重组。）
+  - 否则设置```cycles_wo_finds```为0.
+  - 令prev_queued等于queued_paths
+  - 如果设置了```sync_id```并且```queue_cycle == 1```，并且环境变量中设置了```AFL_IMPORT_FIRST```
+    - 调用```sync_fuzzers(use_argv)```
+- 调用```fuzz_one(use_argv)```对于我们的样本进行变换后fuzz，返回skipped_fuzz
+- 若skipped_fuzz为0，并且stop_soon为0，并且设置了sync_id
+  - 若sync_interval_cnt没有到一个周期（% SYNC_INTERVAL）
+    - 调用```sync_fuzzers(use_argv)```同步其他fuzzer
+- 如果没有设置stop_soon，且 exit_1不为0，那么设置stop_soon=2后break出fuzz主循环。
+- 否则准备fuzz队列中下一个样本。
+- 主循环结束后，销毁内存空间，关闭描述符，输出/更新一些状态，至此整个afl的fuzz过程就结束了。
+## fuzz主循环中的关键函数
+### fuzz_one(char **argv)
+**从队列中取出当前的一项，然后进行fuzz，返回0如果fuzz成功。返回1如果跳过或者bailed out**
+- 如果设置了```pending_favored```
+  - 查看（当前queue中的这一项是否已经fuzz过了或者不是favored）并且打一个100以内的随机数，如果小于```SKIP_TO_NEW_PROB```（百分之99）
+    - 直接return 1.
+- 如果非dumb_mode，且当前的不是favored，并且queued_paths > 10
+  - 若queue_cycle > 1，并且当前的queue_cur还没有fuzz过。
+    - 打一个100以内的随机数，如果小于```SKIP_NFAV_NEW_PROB```，直接return 1.（百分之75）
+  - 否则打一个100以内的随机数，如果小于```SKIP_NFAV_OLD_PROB```，直接return 1.（百分之95）
+- 如果不是tty模式。
+  - 输出```current_entry, queued_paths, unique_crashes```提示信息，刷新stdout缓冲区
+- 将当前的test case映射进入内存。
+  ```orig_in = in_buf = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0)```
+- 分配len大小的空间，初始化为0，返回给out_buf。
+- 设置```subseq_tmouts```为0
+- 设置```cur_depth```为```queue_cur->depth```
+
+**CALIBRATION (only if failed earlier on)阶段**
+- 如果当前的```queue_cur->cal_failed```不为0（存在校准错误）
+  - 如果校准错误的次数小于三次。
+    - 重制exec_cksum来告诉```calibrate_case```重新执行testcase来避免对于无效trace_bits的使用。
+    - 设置```queue_cur->exec_cksum```为0.
+    - 对于queue_cur重新执行```calibrate_case```。
+    ```res = calibrate_case(argv, queue_cur, in_buf, queue_cycle - 1, 0)```
+    - 如果返回值为FAULT_ERROR，那么直接abort
+  - 如果设置了stop_soon，或者res不等于crash_mode。
+    - cur_skipped_paths计数加一。
+    - 跳转到```abandon_entry```
+
+**TRIMMING修剪阶段**
+- 如果不是dumb_mode且当前的没有经过trim（!queue_cur->trim_done）
+  - 调用```trim_case```对当前项进行修建。返回res
+    ```trim_case(argv, queue_cur, in_buf)```
+  - 如果res为FAULT_ERROR，直接abort
+  - 如果设置了stop_soon
+    - cur_skipped_paths计数加一。
+    - 跳转到abandon_entry
+  - 设置当前queue_cur为已经trim过。
+    ```queue_cur->trim_done = 1```
+  - 如果len不等于queue_cur->len。
+    - 令len = queue_cur->len。
+- 将in_buf中的内容拷贝len到out_buf。
+
+**PERFORMANCE SCORE阶段**
+- 调用```calculate_score(queue_cur)```计算当前queue_cur的score
+- 如果设置了skip_deterministic或者queue_cur->was_fuzzed（被fuzz过了）或者queue_cur->passed_det=1
+  - 直接goto havoc_stage
+- 如果当前的```queue_cur->exec_cksum % master_max```不等于master_id - 1，那么goto havoc_stage
+  *Skip deterministic fuzzing if exec path checksum puts this out of scope for this master instance.*
+- 设置doing_det = 1
+
+**SIMPLE BITFLIP (+dictionary construction)阶段**
+```c
+stage_short = "flip1";
+stage_name = "bitflip 1/1";
+```
+- 定义stage_max为len << 3
+- stage_val_type为STAGE_VAL_NONE
+- orig_hit_cnt为queued_paths + unique_crashes
+- 而prev_cksum为queue_cur->exec_cksum
+- 接下来进入一个for循环
+ ```c
+
+    for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
+
+        stage_cur_byte = stage_cur >> 3;
+
+        FLIP_BIT(out_buf, stage_cur);
+
+        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+
+        FLIP_BIT(out_buf, stage_cur);
+        
+        .......
+    }
+ ```
+ 这个循环中调用了```FLIP_BIT(out_buf, stage_cur)```
+ ```c
+#define FLIP_BIT(_ar, _b) do { \
+    u8* _arf = (u8*)(_ar); \
+    u32 _bf = (_b); \
+    _arf[(_bf) >> 3] ^= (128 >> ((_bf) & 7)); \
+  } while (0)
+```
+  - ```(_bf) & 7)```相当于模8，产生了（0、1、2、3、4、5、6、7）
+  - 128是二进制的10000000.
+  - 等式的右边相当于将128右移动0-7个单位产生了二进制从（10000000 - 1）
+  - ```(_bf) >> 3```相当于_bf/8
+  - stage_cur最大为stage_max相当于len << 3
+  - 所以对于```FLIP_BIT(_ar, _b)```来说，```_bf```最大为```(len << 3)>>3```还是len
+  - 也就是说，对于这个for循环来说，每运行8次循环```_arf[i]```（大小为一个字节）的下标i就会加一，i最大为len。
+  - 同时在每8次为一组的循环中，128分别右移0、1、2、3、4、5、6、7位，将右移后产生的数字与```_arf[i]```进行异或翻转，而```_arf[i]```大小为一个字节，等价于对这个字节的每一位都做一次翻转异或
+  ![](https://s3.ax1x.com/2021/02/05/yG38S0.png)
+  - 当这一位被异或完毕后，调用```common_fuzz_stuff(argv, out_buf, len)```进行fuzz。
+    - 如果返回1，```goto abandon_entry```
+  - 最后再调用一次```FLIP_BIT(out_buf, stage_cur)```异或翻转回来。
+  - 这一部分代码中给出了注释进行解释：
+  比如说对于一串二进制：
+  xxxxxxxxIHDRxxxxxxxx
+  当我们改变IHDR中的任意一个都会导致路径的改变or破坏， "IHDR"就像在二进制串中的一整体的具有原子性的可检查的特殊值（原语？）。*"IHDR" is an atomically-checked magic value of special significance to the fuzzed format.*，afl希望能找到这些值。
+  - 如果不是dumb_mode且stage_cur & 7不等于7
+    - 计算当前trace_bits的hash32为cksum
+    - 如果当前到达最后一轮循环并且cksum == prev_cksum
+      - 如果a_len小于MAX_AUTO_EXTRA
+        - 令```a_collect[a_len]```为out_buf[stage_cur >> 3]
+        - a_len递增1
+      - 如果a_len 在MIN_AUTO_EXTRA与MAX_AUTO_EXTRA之间
+        - 调用```maybe_add_auto(a_collect, a_len)```
+    - 如果cksum != prev_cksum
+      - 如果a_len 在MIN_AUTO_EXTRA与MAX_AUTO_EXTRA之间
+        - 调用```maybe_add_auto(a_collect, a_len)```将发现的新token加入a_extra[]
+      - a_len归零
+      - 令prev_cksum = cksum
+    - 如果cksum != queue_cur->exec_cksum
+      - 若a_len < MAX_AUTO_EXTRA
+        - a_collect[a_len] = out_buf[stage_cur >> 3]
+      - a_len递增1.
+- 更新new_hit_cnt为queued_paths + unique_crashes
+- 更新```stage_finds[STAGE_FLIP1]```
+  ```stage_finds[STAGE_FLIP1] += new_hit_cnt - orig_hit_cnt```
+  加上所有的新的路径和新crashs
+- 更新```stage_cycles[STAGE_FLIP1]```
+  ```stage_cycles[STAGE_FLIP1] += stage_max```
+  加上bitflip 1/1阶段for循环中执行的次数（common_fuzz_stuff）
+
+接下来进入```bitflip 2/1```
+- 保存当前new_hit_cnt到orig_hit_cnt。
+- 经过一个for循环做bit flip和样例运行。
+ ```c
+     stage_name = "bitflip 2/1";
+     stage_short = "flip2";
+     stage_max = (len << 3) - 1;
+
+     orig_hit_cnt = new_hit_cnt;
+     for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
+
+        stage_cur_byte = stage_cur >> 3;
+
+        FLIP_BIT(out_buf, stage_cur);
+        FLIP_BIT(out_buf, stage_cur + 1);
+
+        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+
+        FLIP_BIT(out_buf, stage_cur);
+        FLIP_BIT(out_buf, stage_cur + 1);
+    }
+ ```
+ 这一次唯一的不同是是每次连续异或翻转两个bit。
+- 翻转结束后更新new_hit_cnt
+- 更新```stage_finds[STAGE_FLIP2]```与```stage_cycles[STAGE_FLIP2]```
+
+- 接下来同样的进入```bitflip 4/1```，连续翻转4次
+- 生成Effector map
+  ```c
+      /* Effector map setup. These macros calculate:
+
+     EFF_APOS      - position of a particular file offset in the map.
+     EFF_ALEN      - length of a map with a particular number of bytes.
+     EFF_SPAN_ALEN - map span for a sequence of bytes.
+
+   */
+
+  #define EFF_APOS(_p)          ((_p) >> EFF_MAP_SCALE2)
+  #define EFF_REM(_x)           ((_x) & ((1 << EFF_MAP_SCALE2) - 1))
+  #define EFF_ALEN(_l)          (EFF_APOS(_l) + !!EFF_REM(_l))
+  #define EFF_SPAN_ALEN(_p, _l) (EFF_APOS((_p) + (_l) - 1) - EFF_APOS(_p) + 1)
+  ```
+  - 首先分配len大小的空间eff_map
+  - 将eff_map[0]初始化为1；将eff_map[(len - 1)>>3]初始化为1（及第一项和最后一项）
+
+- 进入```"bitflip 8/8"```阶段
+  - 本阶段有一个很重要的思想：我们通过对于 out_buf所有bit进行异或翻转，如果产生了不一样的路径，就在eff_map中标记为1，否则为0。因为如果对所有bit都做翻转还无法带来相关的路径变化，afl认为在后续的一些开销更大的阶段，参考eff_map，可以对这些无效的byte进行跳过。减小开销。
+  - 这个阶段中不是通过FILP宏来做翻转，而是直接与0xff做异或。
+  ```c
+  for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
+
+        stage_cur_byte = stage_cur;
+
+        out_buf[stage_cur] ^= 0xFF;   //直接通过对于out_buf的每一个字节中的每一个bit做异或翻转。
+
+        if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;  //运行对应的test case（翻转后）
+
+        if (!eff_map[EFF_APOS(stage_cur)]) {  //如果eff_map[stage_cur>>3]为0的话
+            //EFF_APOS宏也起到了一个将stage_cur>>3的效果
+            u32 cksum;
+
+            /* If in dumb mode or if the file is very short, just flag everything
+         without wasting time on checksums. */
+
+            if (!dumb_mode && len >= EFF_MIN_LEN)//如果不是dumb_mode且len大于最小的EFF_MIN_LEN
+                cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);//计算hash32
+            else                                //否则，如果是dumb mode或者len过小
+                cksum = ~queue_cur->exec_cksum;
+
+            if (cksum != queue_cur->exec_cksum) {
+                eff_map[EFF_APOS(stage_cur)] = 1;//产生新的路径，发生了变化，此时直接将对应的eff_map中的项标记为1
+                eff_cnt++;
+            }
+
+        }
+
+        out_buf[stage_cur] ^= 0xFF;//从新异或回来
+
+    }
+  ```
+  - 如果eff_map的密度超过了EFF_MAX_PERC，那么将整个eff_map都标记为1（即使不这样做，我们也不会省很多时间）
+  - 更新new_hit_cnt、stage_finds[STAGE_FLIP8]、stage_cycles[STAGE_FLIP8]
+  - 如果len<2，直接跳到```skip_bitflip```
+- 进入```"bitflip 16/8"```
+  - 唯一不同的是，在异或变异之前先检查了对应的eff_map的对应两个字节是否为0
+    - 如果是0，```stage_max```计数减1.然后continue跳过。
+    - 否则进行异或翻转后运行。
+- 更新new_hit_cnt、stage_finds[STAGE_FLIP16]、stage_cycles[STAGE_FLIP16]
+- 如果len<4，跳转到skip_bitflip
+- 接下来是```"bitflip 32/8"```，与上述基本相同。
+- ```skip_bitflip:```
+  - 如果设置了```no_arith```
+    - goto ```skip_arith```
+
+**ARITHMETIC INC/DEC 阶段**
+本阶段主要做加减变异
+ ```c
+#define ARITH_MAX           35
+ ```
+
+- ```"arith 8/8"```以byte为单元变异阶段
+  - 首先扫描out_buf。
+    ```u8 orig = out_buf[i]```（此时一个orig是一个字节，此阶段是**按字节**扫描）
+  - 如果对应的eff_map中的项为0，则stage_max减去2倍的ARITH_MAX，然后continue跳过此次变异
+  - 否则进入一个for循环进行变异->运行
+    ```c
+            u8 orig = out_buf[i];
+            .......
+            for (j = 1; j <= ARITH_MAX; j++) {  //依次扫描orig到orig+35
+
+            u8 r = orig ^(orig + j);            //将orig与orig+j（j最大为35）进行异或翻转
+
+            /* Do arithmetic operations only if the result couldn't be a product
+         of a bitflip. */
+
+            if (!could_be_bitflip(r)) { //判断是否为可以通过上一阶段bitfilp得到的（这一步是为了防止相同的冗余变异，节省时间）
+
+                stage_cur_val = j;
+                out_buf[i] = orig + j;  //将out_buf[i]本身加j变异
+
+                if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;//进行fuzz
+                stage_cur++;
+
+            } else stage_max--;         //否则stage_max减1
+
+            r = orig ^ (orig - j);      //将orig与orig-j（j最大为35）进行异或翻转
+
+            if (!could_be_bitflip(r)) {//如果判断为可以bitfilp
+
+                stage_cur_val = -j;
+                out_buf[i] = orig - j;//将out_buf[i]本身减j变异
+
+                if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;//进行fuzz
+                stage_cur++;
+
+            } else stage_max--;
+
+            out_buf[i] = orig;      
+
+        }
+    ```
+
+- ```"arith 16/8"```阶段
+  - 此时以2个字节（word）为单位进行加减变异，并且对于大端序与小端序都进行变异。
+- ```"arith 32/8"```阶段
+  - 以4个字节（32bits）为单位进行加减变异，并且对于大端序与小端序都进行变异。
+
+**INTERESTING VALUES阶段**
+本阶段主要做替换变异
+- 首先是```"interest 8/8"```阶段，以一个字节为单位进行**替换**变异
+  - 本阶段首先通过```could_be_bitflip(orig ^ (u8) interesting_8[j])||could_be_arith(orig, (u8) interesting_8[j], 1))```
+    保证替换不会由前面的异或和加减变异阶段得到（本质是在防止冗余变换，减小开销）
+  - 然后通过``` out_buf[i] = interesting_8[j]```进行一个字节的替换。
+  - 之后调用```common_fuzz_stuff(argv, out_buf, len)```进行fuzz
+- ```"interest 16/8"```阶段，以两个字节为单位进行替换变异，并且去除异或、加减、与单字节变异阶段的冗余，同时考虑大小端序。
+- ```"interest 32/8"```阶段（4字节为单位替换变异）与前面类似。
+
+**DICTIONARY STUFF阶段**
+本阶段主要基于用户提供的extra来进行一定的变异
+- ```"user extras (over)"```替换阶段
+  - 在满足一定大小的条件下（同时有一定随机性），将用户的extra token以memcpy的方式替换/覆写（over）进去，然后进行fuzz
+  ```c
+  memcpy(out_buf + i, extras[j].data, last_len);
+  if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
+  ```
+  - 最后在进行恢复。
+- ```"user extras (insert)"```插入阶段
+  - 插入（insert）用户的extras[j]，然后产生一个新的ex_tmp，对于这个ex_tmp进行fuzz。
+- ```"auto extras (over)"```替换阶段2
+  - 本阶段类似于over，只不过用于替换的变成了```a_extras[j]```而非```extras[j]```
+
+- 接下来到达标签：```skip_extras:```，如果我们在不跳至havoc_stage或abandon_entry的情况下来到这里，说明我们已经正确的完成了确定的fuzz（deterministic steps）步骤，我们可以对其进行标记如 .state/ 目录
+  - 如果没有设置```queue_cur->passed_det```
+    - 调用```mark_as_det_done(queue_cur)```进行标记。
+
+**RANDOM HAVOC（随机毁灭）阶段**
+本阶段做大范围的随机变异。
+- 首先检测如果没有设置```splice_cycle```
+  - 那么标记此阶段为```"havoc"```
+- 否则标记此阶段为```"splice"```
+- 设置stage_max
+  - 在每一轮stage中首先产生随机数```use_stacking```
+  - 根据产生的```use_stacking```做相应次数的变换。相当于每一轮stage中具体的变换由多次小变化叠加产生。
+  - 每次变换具体的内容也由一个随机数决定。
+    ```UR(15 + ((extras_cnt + a_extras_cnt) ? 2 : 0))```
+    - 随机替换一个```interesting_8[]```中的byte进来
+    - 随机替换```interesting_16[]```中的某个word进来（大小端序随机选择）
+    - 随机替换```interesting_32[]```中的某个dword进来（大小端序随机选择）
+    - 随机选取```out_buf[]```中某个byte进行减变异（减随机数）
+    - 随机选取```out_buf[]```中某个byte进行加变异（加随机数）
+    - 随机选取```out_buf[]```中某个word进行减变异（减随机数，大小端序随机选择）
+    - 随机选取```out_buf[]```中某个word进行加变异（加随机数，大小端序随机选择）
+    - 随机选取```out_buf[]```中某个dword进行减变异（减随机数，大小端序随机选择）
+    - 随机选取```out_buf[]```中某个dword进行加变异（加随机数，大小端序随机选择）
+    - 随机选取```out_buf[]```中某个byte进行异或翻转变异
+    - 随机选取```out_buf[]```中某个byte进行删除
+    - 随机选取```out_buf[]```中某个位置插入一段随机长度```clone_to = UR(temp_len)```的内容。这段内容有75%的概率是原来```out_buf[]```中的内容；有25%的概率是一段相同的随机选取的数字。（这串随机选取的数字有50%的几率随机生成，有50%的几率从out_buf中选一个字节）
+    - 随机选取```out_buf[]```中某个位置覆写一段随机长度的内容。这段内容有75%的概率是原来```out_buf[]```中的内容；有25%的概率是一段相同的随机选取的数字。（这串随机选取的数字有50%的几率随机生成，有50%的几率从out_buf中选一个字节）
+    - 随机选取一段内容覆写成extra token
+      ```a_extras[use_extra].data```或者```extras[use_extra].data```
+    - 随机选取一段内容插入extra token
+      ```a_extras[use_extra].data```或者```extras[use_extra].data```
+  - 至此，叠加变化结束，调用```common_fuzz_stuff(argv, out_buf, temp_len)```对进行这些随机大变换后的进行fuzz。
+  - 如果fuzz后的```queued_paths```与```havoc_queued```不一样了，说明发现了新路径，更新stage_max、perf_score、havoc_queued。
+  
+**SPLICING阶段**
+- 当没有```define IGNORE_FINDS```时。如果我们经过了一整轮什么都没有发现，那么afl会进入```retry_splicing:```这里进一步的对于输入样本进行变换，通过拼接另一个输入样本来完成此变换，最后又跳回```havoc_stage```上一阶段进行大范围的随机变换。
+- 否则设置```ret_val = 0```
+- 到达```abandon_entry:```
+- 设置```splicing_with = -1```
+- 对于队列当前项信息更新。
+  - 如果未设置stop_soon且queue_cur->cal_failed为0，queue_cur->was_fuzzed未被标记已经fuzz过。
+    - 标记queue_cur->was_fuzzed为已经fuzz过了
+    - pending_not_fuzzed计数减1
+    - 如果当前对象是favored，那么pending_favored计数也减1
+- return ret_val
+- 至此，fuzz_one结束。
+### sync_fuzzers(char **argv)
+本函数用于抓取其他fuzzer的case，读取其他fuzz文件夹下的文件调用，记录下来我们最后一个打开的文件的qd_ent->d_name，最后将其写到```out_dir/.synced/sd_ent->d_name```中
+- 首先打开目录```sync_dir```
+- 然后通过```readdir(sd)```返回一个指向struct dirent的指针sd_ent。
+- 接下来通过一个while循环遍历```sync_dir```目录下的所有文件。（由其他的fuzzer创建的）
+  - 首先跳过```.```还有我们自己本fuzzer创建的文件。
+  - 接着打开```"sync_dir/sd_ent->d_name/queue"```目录。
+  - 检索最后看到的测试用例的ID。
+  - 打开```out_dir/.synced/sd_ent->d_name```，返回到id_fd。
+  - 接着从打开的id_fd读取一个```sizeof(u32)```到```min_accept```。
+  - 然后lseek从新调整文件内指针到开头。
+  - 设置当前的``` next_min_accept```为我们刚刚读取的```min_accept```。
+  - ```sync_cnt```计数加一，由"sync %u"格式化到```stage_tmp```中。
+  - 设置```stage_cur = stage_max = 0```
+  - 接下来利用一个while循环对于此fuzzer排队的每个文件，解析ID并查看我们之前是否曾看过它； 如果没有，执行此个测试用例。
+  - 我们利用```readdir(qd)```进一步取出目录中的文件。
+    ```while ((qd_ent = readdir(qd))) ```
+    - 若文件以'.'开头，或者```syncing_case < min_accept```或者；或者我们使用
+    ```sscanf(qd_ent->d_name, CASE_PREFIX "%06u", &syncing_case)```失败返回-1。直接跳过此次case的扫描。
+    - 如果```syncing_case >= next_min_accept```。
+      - 设置```next_min_accept```为```syncing_case + 1```
+    - 打开```qd_path/qd_ent->d_name```返回为fd。
+    - 忽略大小为0和超过大小的文件。
+    - 将fd对应的文件映射到进程空间中，返回```u8 *mem```
+    - 调用```write_to_testcase(mem, st.st_size)```将其写到outfile中。
+    - 接着```run_target```运行对应文件，返回fault。
+    - 如果设置了stop_soon，直接返回。
+    - 将```syncing_party```置为```sd_ent->d_name```
+    - 调用```save_if_interesting(argv, mem, st.st_size, fault)```将感兴趣的样本保存。
+    - 设置```syncing_party = 0```
+    - 调用 ```munmap(mem, st.st_size)``` 接触映射。
+    - 然后 ```stage_cur++ % stats_update_freq``` 如果是0即循环到一个周期，那么输出对应的fuzz信息。
+  - 将```&next_min_accept```对应文件中的内容写到id_fd对应的文件中。 
+  - 关闭对应的文件/目录描述等。
+
+### save_if_interesting(char **argv, void *mem, u32 len, u8 fault)
+本函数用于检测我们在```run_target```中运行的文件返回的结果是否是“有趣的”，进而确定是否要在未来的分析时保存或者插入队列中。若需要返回1，否则返回0.
+- 如果fault等于crash_mode。
+  - 查看此时是否出现了newbits。
+  - 如果没有的话若设置了crash_mode，则total_crashes计数加一。return 0；
+    - 否则直接return 0；
+  - 若出现了newbits则调用 ```fn = alloc_printf("%s/queue/id:%06u,%s", out_dir, queued_paths,describe_op(hnb));```拼接出路径fn
+  - 通过调用```add_to_queue(fn, len, 0)```将其插入队列。
+  - 如果```hnb==2```成立。（有新路径发现）
+    - 设置```queue_top->has_new_cov```为1。同时```queued_with_cov```计数加一。
+  - 利用hash32从新计算trace_bits的哈希值，将其设置为```queue_top->exec_cksum```
+  - 调用```calibrate_case```进行用例校准，评估当前队列。
+  - 打开fn，将mem的内容写入文件fn。
+  - 设置keeping = 1.
+- 接下来通过switch来判断fault类型。
+  - ```FAULT_TMOUT```
+    - 首先```total_tmouts```计数加一。
+    - 如果```nique_hangs >= KEEP_UNIQUE_HANG```那么直接返回keeping
+    - 如果不是```dumb_mode```
+      - 调用```simplify_trace```对trace_bits进行调整。
+      - 若没有新的超时路径，直接returnkeeping。
+      ```if (!has_new_bits(virgin_tmout)) ```
+    - unique_tmouts计数加一。
+    - 如果```exec_tmout小于hang_tmout```
+      - 将mem的内容写到outfile。
+      - 然后再次调用```run_target```运行一次，返回new_fault。
+      - 如果未设置```stop_soon```，并且new_fault为``` FAULT_CRASH```，那么跳转到```keep_as_crash```
+      - 如果设置了```stop_soon```，或者```new_fault != FAULT_TMOUT```，直接return keeping。
+    - 拼接出路径：
+      ```fn = alloc_printf("%s/hangs/id:%06llu,%s", out_dir,unique_hangs, describe_op(0));```
+    - ```unique_hangs```计数加一。
+    - 通过```get_cur_time()```获取last_hang_time
+    - break；
+  - ```FAULT_CRASH```
+    - ```keep_as_crash:```
+    - total_crashes计数加一。
+    - 如果```unique_crashes >= KEEP_UNIQUE_CRASH```
+      - 直接返回keeping；
+    - 若dumb_mode=0
+      - 调用simplify_trace规整trace_bits
+      - 若没有新的crash路径，直接return keeping。
+    - 如果unique_crashes=0
+      - 调用```write_crash_readme()```
+    - 拼接出路径：
+      ```fn = alloc_printf("%s/crashes/id:%06llu,sig:%02u,%s", out_dir,unique_crashes, kill_signal, describe_op(0));```
+    - ```unique_crashes```计数加一。
+    - 获取当前时间为last_crash_time。
+    - 令last_crash_execs为total_execs。
+    - break
+  - ```FAULT_ERROR```
+    - 输出提示信息后直接abort。
+  - ```default:```
+    - 返回keeping。
+- 接下来将mem中的内容写出到文件fn中。
+- return keeping。
+
+### simplify_trace(u64 *mem)
+```c
+/* Destructively simplify trace by eliminating hit count information
+   and replacing it with 0x80 or 0x01 depending on whether the tuple
+   is hit or not. Called on every new crash or timeout, should be
+   reasonably fast. */
+
+static const u8 simplify_lookup[256] = {
+
+        [0]         = 1,
+        [1 ... 255] = 128
+
+};
+```
+- 8个bytes为一组扫描整个mem（trace_bits）
+- 如果当前这一组*mem不空。
+  - 令```u8 *mem8 = (u8 *) mem;```
+  - 那么取```simplify_lookup[mem8[i]]```放入```mem8[i]```
+    代表当命中了（mem8[i]=1）时，对应的是mem8[i]被设置为128。（0b10000000）
+    没命中被设置为mem8[i]被设置为1。
+- 当(*mem)为0时。
+  - 设置这一组为```0x0101010101010101```，代表都没有命中，每个字节被置1.
+- mem++，后移到下一组。
+### trim_case(char **argv, struct queue_entry *q, u8 *in_buf) 
+```c
+    static u8 tmp[64];
+    static u8 clean_trace[MAP_SIZE];
+
+    u8 needs_write = 0, fault = 0;
+    u32 trim_exec = 0;
+    u32 remove_len;
+    u32 len_p2;
+```
+对于我们的test case进行修剪。
+- 如果过当前队列entry的len<5，那么直接return 0；
+- 令stage_name指向tmp数组首位。bytes_trim_in计数加上当前的q->len。
+- 接着找出使得2^x > q->len的最小的x，作为len_p2。
+  ```len_p2 = next_p2(q->len)```
+- 设置remove_len为```MAX(len_p2 / TRIM_START_STEPS, TRIM_MIN_BYTES)```
+  即len_p2/16，与4中最大的那个，作为步长。
+- 通过一个while循环调整步长，直到变得太长或太短。```while (remove_len >= MAX(len_p2 / TRIM_END_STEPS, TRIM_MIN_BYTES))```（每轮remove_len/2）
+  - 首先令```remove_pos = remove_len```
+  - 通过```sprintf```格式化```remove_len```到tmp中。
+  - 令当前的stage_cur为0， stage_max为```q->len / remove_len```
+  - 进入一个while循环```while (remove_pos < q->len)```
+    - 令```trim_avail = MIN(remove_len, q->len - remove_pos)```
+    - 调用```write_with_gap```
+    - 接着```run_target```运行此样例，返回fault。
+    - ```trim_execs```计数加一。
+    - 如果设置了stop_soon或者fault == FAULT_ERROR，直接跳转到```abort_trimming```
+    - 计算当前trace_bits的hash32为cksum。
+    - 如果当前的q->exec_cksum与计算出来的cksum相等。
+      - 令```move_tail```为q->len - remove_pos - trim_avail。
+      - q->len减去trim_avail
+      - 重新计算当前的```len_p2 = next_p2(q->len)```
+      - 从```in_buf + remove_pos + trim_avail```复制```move_tail```个字节到```in_buf + remove_pos```
+      - 如果```needs_write```为0.
+        - 设置```needs_write = 1```
+        - 拷贝trace_bits到clean_trace
+    - 如果不等，remove_pos前移remove_len个字节。
+    - 如果trim的次数到达一个周期，那么输出信息。
+    - ```stage_cur```计数加一。
+  - ```remove_len```减半
+- 如果设置了needs_write
+  - 打开q->fname对应的文件。
+  - 将in_buf中的内容写出到q->fname文件
+  - 拷贝clean_trace到trace_bits
+  - 调用```update_bitmap_score(q)```更新此时的bitmap信息。
+- ```abort_trimming:```
+  - bytes_trim_out加上q->len
+  - return fault。
+
+
+
+### write_with_gap(void *mem, u32 len, u32 skip_at, u32 skip_len)
+```c
+static void write_with_gap(void *mem, u32 len, u32 skip_at, u32 skip_len) {
+
+    s32 fd = out_fd;
+    u32 tail_len = len - skip_at - skip_len;
+
+    if (out_file) {
+
+        unlink(out_file); /* Ignore errors. */
+
+        fd = open(out_file, O_WRONLY | O_CREAT | O_EXCL, 0600);
+
+        if (fd < 0) PFATAL("Unable to create '%s'", out_file);
+
+    } else lseek(fd, 0, SEEK_SET);
+
+    if (skip_at) ck_write(fd, mem, skip_at, out_file);
+
+    if (tail_len) ck_write(fd, mem + skip_at + skip_len, tail_len, out_file);
+
+    if (!out_file) {
+
+        if (ftruncate(fd, len - skip_len)) PFATAL("ftruncate() failed");
+        lseek(fd, 0, SEEK_SET);
+
+    } else close(fd);
+
+}
+```
+
+### calculate_score(struct queue_entry *q)
+*Calculate case desirability score to adjust the length of havoc fuzzing.*
+- 首先计算平均时间
+  ```avg_exec_us = total_cal_us / total_cal_cycles```
+- 计算平均bitmap大小
+  ```avg_bitmap_size = total_bitmap_size / total_bitmap_entries```
+- 定义初始的```perf_score = 100```
+- 接下来通过给q->exec_us乘一个系数，判断他和avg_exec_us的大小来调整perf_score。
+  ```c
+   if (q->exec_us * 0.1 > avg_exec_us) perf_score = 10;
+    else if (q->exec_us * 0.25 > avg_exec_us) perf_score = 25;
+    else if (q->exec_us * 0.5 > avg_exec_us) perf_score = 50;
+    else if (q->exec_us * 0.75 > avg_exec_us) perf_score = 75;
+    else if (q->exec_us * 4 < avg_exec_us) perf_score = 300;
+    else if (q->exec_us * 3 < avg_exec_us) perf_score = 200;
+    else if (q->exec_us * 2 < avg_exec_us) perf_score = 150;
+  ```
+- 然后通过给q->bitmap_size 乘一个系数，判断与avg_bitmap_size的大小关系来调整perf_score。
+  ```c
+  if (q->bitmap_size * 0.3 > avg_bitmap_size) perf_score *= 3;
+    else if (q->bitmap_size * 0.5 > avg_bitmap_size) perf_score *= 2;
+    else if (q->bitmap_size * 0.75 > avg_bitmap_size) perf_score *= 1.5;
+    else if (q->bitmap_size * 3 < avg_bitmap_size) perf_score *= 0.25;
+    else if (q->bitmap_size * 2 < avg_bitmap_size) perf_score *= 0.5;
+    else if (q->bitmap_size * 1.5 < avg_bitmap_size) perf_score *= 0.75;
+  ```
+- 如果q->handicap大于等于4
+  - perf_score乘4.
+  - q->handicap减4.
+- 否则，若q->handicap不为0
+  - perf_score乘2.
+  - q->handicap减1.
+- 通过深度来调整
+  ```c
+      switch (q->depth) {
+
+        case 0 ... 3:
+            break;
+        case 4 ... 7:
+            perf_score *= 2;
+            break;
+        case 8 ... 13:
+            perf_score *= 3;
+            break;
+        case 14 ... 25:
+            perf_score *= 4;
+            break;
+        default:
+            perf_score *= 5;
+
+    }
+  ```
+- 最后保证我们调整后的不会超出最大界限。
+- return perf_score
+
+### common_fuzz_stuff(char **argv, u8 *out_buf, u32 len)
+写出修改后的测试用例，运行程序，处理result与错误等。
+- 如果设置了post_handler
+  - 调用```post_handler(out_buf, &len)```，返回out_buf
+  - 若out_buf为0或len为0，return 0；
+- 调用``` write_to_testcase```写出out_buf
+- ```run_target```运行要fuzz的程序，返回fault。
+- 如果设置了stop_soon，直接返回1
+- 如果```fault等于FAULT_TMOUT```
+  - ```subseq_tmouts```计数加一
+  - 如果大于TMOUT_LIMIT
+    - cur_skipped_paths计数加一后return 1；
+- 否则令```subseq_tmouts = 0```
+- 如果设置```skip_requested```
+  - 归零```skip_requested```
+  - ```subseq_tmouts```计数加一
+  - return 1；
+- 接下来处理```FAULT_ERROR```
+  - ```save_if_interesting```检测我们在```run_target```中运行的文件返回的结果是否是“有趣的”。
+  - 返回值加上```queued_discovered```成为新的```queued_discovered```
+- 根据运行的轮数来输出fuzz统计信息。
+- return 0；
 ## 开始fuzz之前的一些关键函数
 ### setup_signal_handlers()
 在函数开头时有这样一个修饰符 ```EXP_ST``` 主要被用于当afl被build成一个链接库时导出一些变量。
@@ -770,6 +1421,7 @@ Write modified data to file for testing. If out_file is set, the old file
 - 首先检测是否设置out_file。
   - 若设置了。打开outfile然后把mem的内容写到outfile。
   - 若没设置，调整大小。```ftruncate(fd, len)```  .
+  https://baike.baidu.com/item/ftruncate
 
 ### run_target(char **argv, u32 timeout)
 Execute target application, monitoring for timeouts. Return status
@@ -993,6 +1645,28 @@ AddressSanitizer (ASan) is a fast memory error detector based on compiler instru
 基于llvm的一个内存错误快速检测器。
 
 ## 一些函数/宏
+### UR(u32 limit)
+```c
+/* Generate a random number (from 0 to limit - 1). This may
+   have slight bias. */
+
+static inline u32 UR(u32 limit) {
+
+    if (unlikely(!rand_cnt--)) {
+
+        u32 seed[2];
+
+        ck_read(dev_urandom_fd, &seed, sizeof(seed), "/dev/urandom");
+
+        srandom(seed[0]);
+        rand_cnt = (RESEED_RNG / 2) + (seed[1] % RESEED_RNG);
+
+    }
+
+    return random() % limit;
+
+}
+```
 ### alloc_printf
 ```c
 /* User-facing macro to sprintf() to a dynamically allocated buffer. */
